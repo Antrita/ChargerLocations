@@ -1,5 +1,6 @@
 """
 Step 3. Identifying existing corridors where slow/fast chargers are located.
+Enhanced with Google Maps API integration for more accurate corridor identification in EU countries.
 """
 
 import pandas as pd
@@ -20,11 +21,32 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("corridor_identification.log"),
+        logging.FileHandler("corridor_identification_eu.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("corridor-identifier")
+logger = logging.getLogger("corridor-identifier-eu")
+
+# Try to import Google Maps utilities
+try:
+    # Try to import the EU-optimized version first
+    try:
+        from google_maps_utils_eu import batch_process_polygons, get_corridor_name, load_cache, save_cache
+
+        GOOGLE_MAPS_AVAILABLE = True
+        EU_OPTIMIZED = True
+        logger.info("EU-optimized Google Maps utilities available for corridor identification")
+    except ImportError:
+        # Fall back to standard version
+        from google_maps_utils import batch_process_polygons, get_corridor_name, load_cache, save_cache
+
+        GOOGLE_MAPS_AVAILABLE = True
+        EU_OPTIMIZED = False
+        logger.info("Standard Google Maps utilities available for corridor identification")
+except ImportError:
+    GOOGLE_MAPS_AVAILABLE = False
+    EU_OPTIMIZED = False
+    logger.info("Google Maps utilities not available. Will use OpenStreetMap for corridor identification.")
 
 
 def load_data(csv_path):
@@ -65,6 +87,7 @@ def find_roads_in_polygon(polygon, attempt=1, max_attempts=3):
 
         # Overpass API query for major roads within the bounding box
         # We focus on motorways, trunks, primary and secondary roads
+        # Include European motorway designations
         overpass_url = "https://overpass-api.de/api/interpreter"
         overpass_query = f"""
         [out:json];
@@ -73,6 +96,9 @@ def find_roads_in_polygon(polygon, attempt=1, max_attempts=3):
           way["highway"="trunk"]({miny},{minx},{maxy},{maxx});
           way["highway"="primary"]({miny},{minx},{maxy},{maxx});
           way["highway"="secondary"]({miny},{minx},{maxy},{maxx});
+          way["highway"="motorway_link"]({miny},{minx},{maxy},{maxx});
+          way["highway"="trunk_link"]({miny},{minx},{maxy},{maxx});
+          way["route"="road"]({miny},{minx},{maxy},{maxx});
         );
         out body;
         >;
@@ -93,22 +119,33 @@ def find_roads_in_polygon(polygon, attempt=1, max_attempts=3):
                     road_type = element['tags']['highway']
                     road_name = element['tags'].get('name', '')
                     road_ref = element['tags'].get('ref', '')
+                    # Check for European designation (e.g., "E55")
+                    int_ref = element['tags'].get('int_ref', '')
 
                     # Use ref number if name is not available (common for highways)
-                    if not road_name and road_ref:
-                        road_name = road_ref
+                    road_name_final = road_name
+                    if not road_name_final and road_ref:
+                        road_name_final = road_ref
+                    if not road_name_final and int_ref:
+                        road_name_final = int_ref
 
                     # Assign priority based on road type
                     priority = {
                         'motorway': 1,
                         'trunk': 2,
                         'primary': 3,
-                        'secondary': 4
-                    }.get(road_type, 5)
+                        'secondary': 4,
+                        'motorway_link': 5,
+                        'trunk_link': 6
+                    }.get(road_type, 7)
 
-                    if road_name:  # Only include roads with names
+                    # Boost priority for European routes (starting with E)
+                    if int_ref and int_ref.startswith('E'):
+                        priority -= 1
+
+                    if road_name_final:  # Only include roads with names
                         roads.append({
-                            'name': road_name,
+                            'name': road_name_final,
                             'type': road_type,
                             'priority': priority
                         })
@@ -158,6 +195,42 @@ def get_settlement_name(polygon, geocoder, attempt=1, max_attempts=2):
         logger.warning(f"Error in geocoding: {e}")
         time.sleep(1)  # Wait before retry
         return get_settlement_name(polygon, geocoder, attempt + 1, max_attempts)
+
+
+def get_corridor_name_openstreetmap(polygon, geocoder):
+    """
+    Get corridor name using OpenStreetMap (legacy method).
+    Used as a fallback when Google Maps API is not available.
+    Optimized for European road naming conventions.
+    """
+    # Find roads in this polygon
+    roads = find_roads_in_polygon(polygon)
+
+    # Get settlement name
+    settlement = get_settlement_name(polygon, geocoder)
+
+    # Format corridor name
+    if roads:
+        top_road = roads[0]  # Get the highest priority road
+        road_name = top_road['name']
+        road_type = top_road['type']
+
+        # Format based on road type and European conventions
+        if road_type == 'motorway' or road_type == 'motorway_link':
+            # Check for European motorway designation (e.g., "A1", "E55")
+            if road_name.startswith('A') or road_name.startswith('E') or road_name.startswith('M'):
+                corridor_name = f"Motorway {road_name} Corridor ({settlement})"
+            else:
+                corridor_name = f"{road_name} Highway Corridor ({settlement})"
+        elif road_type == 'trunk' or road_type == 'trunk_link':
+            corridor_name = f"{road_name} Route ({settlement})"
+        else:
+            corridor_name = f"{road_name} Corridor ({settlement})"
+    else:
+        # No roads found
+        corridor_name = f"{settlement} Area"
+
+    return corridor_name
 
 
 def display_corridors(df, recent_indices, total=10):
@@ -218,11 +291,37 @@ def evaluate_charger_importance(row):
     return score
 
 
-def identify_transport_corridors(min_distance=500, input_file=None):
-    """Main function to identify corridors"""
+def identify_transport_corridors(min_distance=500, input_file=None, use_google_maps=False, google_maps_api_key=None,
+                                 batch_size=50, save_interval=50):
+    """Main function to identify corridors with EU optimization"""
     try:
-        print("=== Transport Corridor Identification with Overpass API ===")
+        print("=== Transport Corridor Identification (EU Optimized) ===")
         logger.info(f"Starting corridor identification with min_distance={min_distance}km")
+
+        # Check if we should use Google Maps API
+        if use_google_maps:
+            if not GOOGLE_MAPS_AVAILABLE:
+                logger.warning("Google Maps utilities not available despite request to use them.")
+                print("Google Maps utilities not available. Falling back to OpenStreetMap.")
+                use_google_maps = False
+            elif not google_maps_api_key:
+                logger.warning("No Google Maps API key provided. Using OpenStreetMap instead.")
+                print("No Google Maps API key provided. Using OpenStreetMap instead.")
+                use_google_maps = False
+            else:
+                if EU_OPTIMIZED:
+                    logger.info("Using EU-optimized Google Maps API for corridor identification")
+                    print("Using EU-optimized Google Maps API for corridor identification")
+                else:
+                    logger.info("Using Google Maps API for corridor identification")
+                    print("Using Google Maps API for corridor identification")
+                # Set the API key
+                if EU_OPTIMIZED:
+                    import google_maps_utils_eu
+                    google_maps_utils_eu.GOOGLE_MAPS_API_KEY = google_maps_api_key
+                else:
+                    import google_maps_utils
+                    google_maps_utils.GOOGLE_MAPS_API_KEY = google_maps_api_key
 
         # Determine input file path
         if input_file is None:
@@ -239,7 +338,7 @@ def identify_transport_corridors(min_distance=500, input_file=None):
 
         # Check for cache file to resume processing
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_file = os.path.join(script_dir, 'corridor_cache.pkl')
+        cache_file = os.path.join(script_dir, 'corridor_cache_eu.pkl')
         corridor_cache = {}
         if os.path.exists(cache_file):
             try:
@@ -260,22 +359,98 @@ def identify_transport_corridors(min_distance=500, input_file=None):
         total_rows = len(df)
         logger.info(f"Loaded {total_rows} charging location polygons.")
 
-        # Initialize OpenStreetMap geocoder
-        geocoder = Nominatim(user_agent="transport_corridor_identifier")
-        logger.info("Initialized OpenStreetMap geocoder.")
+        # If using Google Maps API, process all polygons in a batch
+        if use_google_maps:
+            # Load the API cache first
+            try:
+                load_cache()
+            except:
+                pass
 
-        # Initialize corridor names column
-        if 'corridor_name' not in df.columns:
-            df['corridor_name'] = None
+            print(f"Batch processing {total_rows} polygons with Google Maps API...")
+            logger.info(f"Batch processing {total_rows} polygons with Google Maps API...")
 
-        # Create a hash function for polygons
-        def hash_polygon(poly):
-            return str(hash(poly.wkt))
+            # Process all polygons at once with regular progress updates
+            df = batch_process_polygons(df, geometry_col='geometry', batch_size=batch_size,
+                                        api_key=google_maps_api_key, save_interval=save_interval)
 
-        # Add a hash column for caching
-        df['poly_hash'] = df['geometry'].apply(hash_polygon)
+            # Save the processed data immediately to avoid losing API calls
+            save_path = os.path.join(script_dir, 'ChargerLocationsRefined.csv')
+            df.to_csv(save_path, index=False)
+            logger.info(f"Saved data with Google Maps corridors to {save_path}")
+        else:
+            # Initialize OpenStreetMap geocoder
+            geocoder = Nominatim(user_agent="transport_corridor_identifier_eu")
+            logger.info("Initialized OpenStreetMap geocoder.")
 
-        # Add centroid column for faster distance calculations
+            # Initialize corridor names column
+            if 'corridor_name' not in df.columns:
+                df['corridor_name'] = None
+
+            # Create a hash function for polygons
+            def hash_polygon(poly):
+                return str(hash(poly.wkt))
+
+            # Add a hash column for caching
+            df['poly_hash'] = df['geometry'].apply(hash_polygon)
+
+            # Process rows
+            print(f"Processing {total_rows} polygons to identify transport corridors...")
+            print(f"Using OpenStreetMap to identify road corridors (EU optimized)...")
+
+            # Keep track of recently processed indices
+            recent_indices = []
+
+            # Use tqdm for progress bar
+            for i, row in tqdm(df.iterrows(), total=total_rows, desc="Processing polygons"):
+                # Skip if already processed
+                if row['poly_hash'] in corridor_cache:
+                    df.at[i, 'corridor_name'] = corridor_cache[row['poly_hash']]
+                else:
+                    polygon = row['geometry']
+
+                    # Get corridor name using OpenStreetMap
+                    corridor_name = get_corridor_name_openstreetmap(polygon, geocoder)
+
+                    # Save to dataframe and cache
+                    df.at[i, 'corridor_name'] = corridor_name
+                    corridor_cache[row['poly_hash']] = corridor_name
+
+                    # Add to recent indices
+                    recent_indices.append(i)
+
+                    # Add a delay to respect API usage policies
+                    time.sleep(1.1)
+
+                # Save progress at specified intervals
+                if (i + 1) % save_interval == 0 or i == len(df) - 1:
+                    # Display recently identified corridors
+                    if recent_indices:
+                        display_corridors(df, recent_indices)
+                        recent_indices = []  # Reset after display
+
+                    # Save cache
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(corridor_cache, f)
+
+                    # Output directory is the same as script directory
+                    output_dir = os.path.dirname(os.path.abspath(__file__))
+
+                    # Remove temporary columns and save
+                    if 'poly_hash' in df.columns:
+                        save_df = df.drop(['poly_hash'], axis=1)
+                    else:
+                        save_df = df
+
+                    save_path = os.path.join(output_dir, 'ChargerLocationsRefined.csv')
+                    save_df.to_csv(save_path, index=False)
+
+                    logger.info(f"Saved checkpoint: {i + 1}/{total_rows} polygons processed")
+                    print(f"Saved checkpoint: {i + 1}/{total_rows} polygons processed")
+                    print(f"Refined data saved to {save_path}")
+
+        # Now that we have corridor names, calculate centroids for all locations
+        print("Calculating centroids for distance filtering...")
         df['centroid'] = df['geometry'].apply(lambda x: x.centroid)
 
         # Calculate importance score for each charging station
@@ -291,9 +466,6 @@ def identify_transport_corridors(min_distance=500, input_file=None):
             # Add a default importance score if calculation fails
             df['importance_score'] = 50
 
-        # Set checkpoint frequency
-        checkpoint_frequency = 50
-
         # Create a dataframe to store selected locations
         selected_df = df.iloc[0:0].copy()
 
@@ -303,58 +475,12 @@ def identify_transport_corridors(min_distance=500, input_file=None):
         # List to store centroids of selected locations for distance checks
         selected_centroids = []
 
-        # Process rows
-        print(f"Processing {total_rows} polygons to identify transport corridors...")
-        print(f"Checkpoints will be saved every {checkpoint_frequency} records")
-
-        # Keep track of recently processed indices
-        recent_indices = []
-
-        # Use tqdm for progress bar
-        for i, row in tqdm(df.iterrows(), total=total_rows, desc="Processing polygons"):
-            # Skip if already processed
-            if row['poly_hash'] in corridor_cache:
-                df.at[i, 'corridor_name'] = corridor_cache[row['poly_hash']]
-            else:
-                polygon = row['geometry']
-
-                # Find roads in this polygon
-                roads = find_roads_in_polygon(polygon)
-
-                # Get settlement name
-                settlement = get_settlement_name(polygon, geocoder)
-
-                # Format corridor name
-                if roads:
-                    top_road = roads[0]  # Get the highest priority road
-                    road_name = top_road['name']
-                    road_type = top_road['type']
-
-                    # Format based on road type
-                    if road_type == 'motorway':
-                        corridor_name = f"Motorway {road_name} Corridor ({settlement})"
-                    elif road_type == 'trunk':
-                        corridor_name = f"Trunk Road {road_name} Corridor ({settlement})"
-                    else:
-                        corridor_name = f"{road_name} Corridor ({settlement})"
-                else:
-                    # No roads found
-                    corridor_name = f"{settlement} Area"
-
-                # Save to dataframe and cache
-                df.at[i, 'corridor_name'] = corridor_name
-                corridor_cache[row['poly_hash']] = corridor_name
-
-                # Add to recent indices
-                recent_indices.append(i)
-
-                # Add a delay to respect API usage policies
-                time.sleep(1.1)
-
-            # Apply filtering logic on the fly
-            corridor = df.at[i, 'corridor_name']
-            centroid = df.at[i, 'centroid']
-            importance_score = df.at[i, 'importance_score']
+        # Filter locations based on distance and importance
+        print("Filtering locations to select representative charging stations...")
+        for i, row in tqdm(df.iterrows(), total=len(df), desc="Filtering locations"):
+            corridor = row['corridor_name']
+            centroid = row['centroid']
+            importance_score = row['importance_score']
 
             # Check if this location should be included
             include_location = False
@@ -388,7 +514,7 @@ def identify_transport_corridors(min_distance=500, input_file=None):
                     include_location = True
 
             # Additional criteria based on truck data:
-            # If this is a high-traffic location (high MainDTN) but wasn't included by other criteria,
+            # If this is a high-traffic location but wasn't included by other criteria,
             # check if we can make an exception
             if not include_location and 'MainDTN' in df.columns:
                 truck_count = df.at[i, 'MainDTN'] if pd.notna(df.at[i, 'MainDTN']) else 0
@@ -397,99 +523,108 @@ def identify_transport_corridors(min_distance=500, input_file=None):
                     relaxed_distance = min_distance * 0.7  # 30% shorter
                     far_enough = True
                     for selected_centroid in selected_centroids:
-                       distance = calculate_distance(centroid, selected_centroid)
-                       if distance < relaxed_distance:
-                          far_enough = False
-                          break
+                        distance = calculate_distance(centroid, selected_centroid)
+                        if distance < relaxed_distance:
+                            far_enough = False
+                            break
 
                     if far_enough:
                         include_location = True
-                # If we're including this location, add it to our selected dataframe
-                if include_location:
-                    selected_df = pd.concat([selected_df, df.iloc[[i]]])
-                    selected_centroids.append(centroid)
 
-                # Save progress at checkpoints
-                if (i + 1) % checkpoint_frequency == 0 or i == len(df) - 1:
-                    # Display recently identified corridors
-                    if recent_indices:
-                        display_corridors(df, recent_indices)
-                        recent_indices = []  # Reset after display
+            # If we're including this location, add it to our selected dataframe
+            if include_location:
+                selected_df = pd.concat([selected_df, df.iloc[[i]]])
+                selected_centroids.append(centroid)
 
-                    # Output directory is the same as script directory
-                    output_dir = os.path.dirname(os.path.abspath(__file__))
-                    # Remove temporary columns and save
-                    save_df = df.drop(['poly_hash', 'centroid', 'importance_score'], axis=1)
-                    save_path = os.path.join(output_dir, 'ChargerLocationsRefined.csv')
-                    save_df.to_csv(save_path, index=False)
+        # Remove temporary columns
+        if 'centroid' in df.columns:
+            df = df.drop(['centroid'], axis=1)
+        if 'importance_score' in df.columns:
+            df = df.drop(['importance_score'], axis=1)
 
-                    # Save filtered data
-                    filtered_save_df = selected_df.drop(['poly_hash', 'centroid', 'importance_score'], axis=1)
-                    filtered_save_path = os.path.join(output_dir, 'ChargerLocationsFiltered.csv')
-                    filtered_save_df.to_csv(filtered_save_path, index=False)
-                    # Save cache
-                    with open(cache_file, 'wb') as f:
-                        pickle.dump(corridor_cache, f)
+        if 'centroid' in selected_df.columns:
+            selected_df = selected_df.drop(['centroid'], axis=1)
+        if 'importance_score' in selected_df.columns:
+            selected_df = selected_df.drop(['importance_score'], axis=1)
 
-                    logger.info(f"Saved checkpoint: {i + 1}/{total_rows} polygons processed")
-                    logger.info(f"Selected {len(selected_df)}/{i + 1} locations so far")
-                    print(f"Saved checkpoint: {i + 1}/{total_rows} polygons processed")
-                    print(f"Selected {len(selected_df)}/{i + 1} locations so far")
-                    print(f"Refined data saved to {save_path}")
-                    print(f"Filtered data saved to {filtered_save_path}")
+        # Save final results
+        output_dir = os.path.dirname(os.path.abspath(__file__))
+        final_path = os.path.join(output_dir, 'ChargerLocationsRefined.csv')
+        filtered_final_path = os.path.join(output_dir, 'ChargerLocationsFiltered.csv')
 
-            # Remove temporary columns
-            df = df.drop(['poly_hash', 'centroid', 'importance_score'], axis=1)
-            selected_df = selected_df.drop(['poly_hash', 'centroid', 'importance_score'], axis=1)
+        df.to_csv(final_path, index=False)
+        selected_df.to_csv(filtered_final_path, index=False)
 
-            # Save final results
-            output_dir = os.path.dirname(os.path.abspath(__file__))
-            final_path = os.path.join(output_dir, 'ChargerLocationsRefined.csv')
-            filtered_final_path = os.path.join(output_dir, 'ChargerLocationsFiltered.csv')
+        # Print summary
+        print("\n=== Processing Complete ===")
+        logger.info("Processing complete!")
+        print(f"Total locations (before filtering): {len(df)}")
+        print(f"Total locations (after filtering): {len(selected_df)}")
+        print(f"Unique corridors identified: {len(set(selected_df['corridor_name']))}")
 
-            df.to_csv(final_path, index=False)
-            selected_df.to_csv(filtered_final_path, index=False)
-            # Print summary
-            print("\n=== Processing Complete ===")
-            logger.info("Processing complete!")
-            print(f"Total locations (before filtering): {len(df)}")
-            print(f"Total locations (after filtering): {len(selected_df)}")
-            print(f"Unique corridors identified: {len(set(selected_df['corridor_name']))}")
+        # Display summary of corridor types
+        corridor_types = []
+        for name in selected_df['corridor_name']:
+            if "Motorway" in str(name):
+                corridor_types.append("Motorway")
+            elif "Highway" in str(name):
+                corridor_types.append("Highway")
+            elif "Route" in str(name):
+                corridor_types.append("Route")
+            elif "Corridor" in str(name):
+                corridor_types.append("Other Road")
+            else:
+                corridor_types.append("Area Only")
+        type_counts = pd.Series(corridor_types).value_counts()
+        print("\nCorridor Type Distribution:")
+        for type_name, count in type_counts.items():
+            print(f"  {type_name}: {count} ({count / len(selected_df):.1%})")
 
-            # Display summary of corridor types
-            corridor_types = []
-            for name in selected_df['corridor_name']:
-                if "Motorway" in str(name):
-                    corridor_types.append("Motorway")
-                elif "Trunk Road" in str(name):
-                    corridor_types.append("Trunk Road")
-                elif "Corridor" in str(name):
-                    corridor_types.append("Other Road")
-                else:
-                    corridor_types.append("Area Only")
-            type_counts = pd.Series(corridor_types).value_counts()
-            print("\nCorridor Type Distribution:")
-            for type_name, count in type_counts.items():
-             print(f"  {type_name}: {count} ({count / len(selected_df):.1%})")
-
-            print(f"\nRefined data saved to {final_path}")
-            print(f"Filtered data saved to {filtered_final_path}")
-            return True
+        print(f"\nRefined data saved to {final_path}")
+        print(f"Filtered data saved to {filtered_final_path}")
+        return True
     except Exception as e:
         # Catch any unhandled exceptions to avoid silent exit
         logger.error(f"Unhandled exception in corridor identification: {e}")
-        logger.error(f"Stack trace: {sys.exc_info()}")
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         print(f"ERROR: {e}")
         return False
 
 
 if __name__ == "__main__":
     # Allow for command-line override of the input file
-    import sys
+    import argparse
 
-    input_file = sys.argv[1] if len(sys.argv) > 1 else None
+    parser = argparse.ArgumentParser(description='Identify transport corridors in charging station data (EU optimized)')
+    parser.add_argument('--csv', type=str, help='Path to CSV file with charger locations')
+    parser.add_argument('--min-distance', type=float, default=500,
+                        help='Minimum distance between charging stations (km)')
+    parser.add_argument('--use-google-maps', action='store_true',
+                        help='Use Google Maps API for corridor identification')
+    parser.add_argument('--api-key', type=str,
+                        help='Google Maps API key (required if --use-google-maps is specified)')
+    parser.add_argument('--batch-size', type=int, default=50,
+                        help='Batch size for Google Maps API requests (default: 50)')
+    parser.add_argument('--save-interval', type=int, default=50,
+                        help='Save after processing this many locations (default: 50)')
 
-    success = identify_transport_corridors(min_distance=500, input_file=input_file)
+    args = parser.parse_args()
+
+    # Check if API key is provided when Google Maps is requested
+    if args.use_google_maps and not args.api_key:
+        print("ERROR: --use-google-maps specified but no API key provided.")
+        print("Please provide an API key with --api-key YOUR_API_KEY")
+        sys.exit(1)
+
+    success = identify_transport_corridors(
+        min_distance=args.min_distance,
+        input_file=args.csv,
+        use_google_maps=args.use_google_maps,
+        google_maps_api_key=args.api_key,
+        batch_size=args.batch_size,
+        save_interval=args.save_interval
+    )
 
     if not success:
         print("Script did not complete successfully. Check the log file.")
@@ -497,4 +632,3 @@ if __name__ == "__main__":
     else:
         print("Script completed successfully.")
         sys.exit(0)  # Explicitly exit with 0 to indicate success
-
