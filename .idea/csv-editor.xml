@@ -24,6 +24,13 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="\Charger_Distr_viz.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="\corridor_recommendations.csv">
           <value>
             <Attribute>
